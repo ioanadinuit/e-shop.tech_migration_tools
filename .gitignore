@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Local working files (CSV exports, generated outputs)
+exports/
+ready/
+img-p/
+*.csv.local
+
+# GDPR — never commit personal data
+*customers*.csv
+*users*.csv
+.env.fragment
+.env
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,3 @@
+# Standard library only for the core transform — no deps needed.
+# Add pip-installable deps here if/when an adapter requires them
+# (e.g. mysql-connector-python for direct DB extraction, beautifulsoup4 for live-site scraping).
