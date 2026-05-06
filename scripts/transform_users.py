@@ -30,11 +30,49 @@ Usage:
 import argparse
 import csv
 import os
+import re
 import sys
 import uuid
 
 
 csv.field_size_limit(2**31 - 1)
+
+
+# Mojibake leftovers from the Presta export: when MySQL was in latin1 but the
+# data was actually UTF-8, diacritics (Romanian ș ț ă â î, Turkish ü ö ş)
+# round-tripped through the CSV as literal "?" runs (one or two per char).
+# We can't recover the original letter losslessly. Replacing each run with
+# a single "u" is a deliberately crude but readable fallback: Üstünsoy ->
+# Ustunsoy is acceptable, and the alternative (dropping the chars entirely
+# -> "Stnsoy") looked corrupt. A handful of Romanian names will end up with
+# wrong vowels (Bitcă -> Bitcu); those can be hand-fixed post-import.
+_MOJIBAKE_RE = re.compile(r"\?+")
+_MOJIBAKE_REPLACEMENT = "u"
+
+def _normalize_name(raw):
+    """Clean Presta-exported customer names.
+
+    Rule: lowercase the whole string, then upper-case the first letter of
+    each word. Word boundaries: start of string, whitespace, comma, hyphen,
+    apostrophe. So "ANGELESCU,CORINA VALENTINA" -> "Angelescu,Corina Valentina",
+    "mitrofan-bitca" -> "Mitrofan-Bitca", "d'angelo" -> "D'Angelo".
+    Mojibake "?" runs are replaced with "u" first (Üstünsoy -> Ustunsoy).
+    """
+    if raw is None:
+        return ""
+    s = _MOJIBAKE_RE.sub(_MOJIBAKE_REPLACEMENT, str(raw))
+    # Strip BOM + all leading/trailing whitespace and punctuation before
+    # collapsing internal runs.
+    s = s.replace("﻿", "").strip()
+    s = re.sub(r"\s+", " ", s).strip(" ,.-")
+    if not s:
+        return ""
+    s = s.lower()
+    return re.sub(
+        r"(^|[\s,\-'])([a-z])",
+        lambda m: m.group(1) + m.group(2).upper(),
+        s,
+    )
 
 
 def _sql_escape(s):
@@ -63,6 +101,30 @@ def main():
         rows = list(csv.DictReader(f))
     print(f"[users] {len(rows)} customer rows read")
 
+    # Support BOTH input shapes:
+    #  - the joined export from sql/presta/06-customers.sql (aliased columns
+    #    like legacy_password_hash, created_at, updated_at, street, ...), and
+    #  - a raw ps_customer.csv dump straight out of phpMyAdmin (passwd,
+    #    date_add, date_upd; no address columns at all).
+    # Normalize to the joined-export keys up front so the rest of the loop
+    # doesn't care which input it got.
+    def _coalesce_keys(r):
+        if "legacy_password_hash" not in r and "passwd" in r:
+            r["legacy_password_hash"] = r.get("passwd")
+        if "created_at" not in r and "date_add" in r:
+            r["created_at"] = r.get("date_add")
+        if "updated_at" not in r and "date_upd" in r:
+            r["updated_at"] = r.get("date_upd")
+        return r
+
+    rows = [_coalesce_keys(r) for r in rows]
+
+    # Raw ps_customer dumps include inactive/deleted rows; the joined SQL
+    # filters them upstream. Mirror that filter here so both inputs converge.
+    rows = [r for r in rows
+            if str(r.get("active", "1")).strip() == "1"
+            and str(r.get("deleted", "0")).strip() == "0"]
+
     # Dedup by email (Presta sometimes has the same email under multiple customer ids)
     by_email = {}
     for r in rows:
@@ -90,12 +152,18 @@ def main():
                 skipped_no_pass += 1
                 continue
 
-            first = (r.get("firstname") or "").strip()
-            last = (r.get("lastname") or "").strip()
+            first = _normalize_name(r.get("firstname"))
+            last = _normalize_name(r.get("lastname"))
             birthdate = (r.get("birthday") or "").strip()
             if birthdate in ("0000-00-00", ""):
                 birthdate = None
             newsletter = _bool_sql(r.get("newsletter", "0"))
+            # Presta's is_guest flag: 1 if the customer was created during
+            # a guest checkout (no password the customer chose), 0 if they
+            # registered an account. Both still have a passwd hash because
+            # Presta auto-generates one — so password presence is NOT a
+            # reliable guest signal.
+            guest = _bool_sql(r.get("is_guest", "0"))
             created_at = (r.get("created_at") or "").strip()
             cust_ref = str(uuid.uuid4())
 
@@ -107,26 +175,43 @@ def main():
                 f"VALUES ({_sql_escape(first)}, {_sql_escape(last)}, {_sql_escape(email)}, "
                 f"{newsletter}, TRUE, {_sql_escape(birthdate)}, TRUE, TRUE, "
                 f"{_sql_escape(created_at)}, {_sql_escape(created_at)}, "
-                f"TRUE, FALSE, FALSE, {_sql_escape(cust_ref)}, {_sql_escape(created_at)})\n"
+                f"TRUE, FALSE, {guest}, {_sql_escape(cust_ref)}, {_sql_escape(created_at)})\n"
                 "ON CONFLICT (email) DO NOTHING;\n"
             )
 
-            # 2. Insert authentication with legacy hash (placeholder bcrypt that nobody can match)
+            # 2. Insert authentication with the legacy Presta hash kept in
+            #    `migration_pass_hash`. Platform's AuthenticationService checks
+            #    that field on login and silently rehashes to bcrypt the
+            #    moment the user types the right plaintext (verified via
+            #    MD5(cookie_key + plain) == migration_pass_hash). Until
+            #    that happens, `password` holds an unmatchable placeholder.
+            #
+            #    No separate "type" column — presence of migration_pass_hash
+            #    is itself the signal. If/when we ever migrate from another
+            #    legacy system that also uses MD5+salt, we'd need a separate
+            #    discriminator column.
             placeholder_pw = f"MIGRATED_{cust_ref}"
             f.write(
                 'INSERT INTO authentication (user_id, username, last_pass_setup, password, '
-                'legacy_password_hash, legacy_password_type)\n'
+                'migration_pass_hash)\n'
                 f"SELECT user_id, {_sql_escape(email)}, {_sql_escape(created_at)}, "
-                f"{_sql_escape(placeholder_pw)}, {_sql_escape(legacy_hash)}, 'PRESTA_MD5'\n"
+                f"{_sql_escape(placeholder_pw)}, {_sql_escape(legacy_hash)}\n"
                 f'FROM "user" WHERE email = {_sql_escape(email)}\n'
                 "ON CONFLICT (user_id) DO NOTHING;\n"
             )
 
-            # 3. Role = USER
+            # 3. Role = USER. The role table has no UNIQUE constraint on
+            #    user_id (multi-role support — same user could be USER + ADMIN),
+            #    so ON CONFLICT doesn't apply. Use WHERE NOT EXISTS for
+            #    idempotency on re-runs.
             f.write(
                 "INSERT INTO role (user_id, role)\n"
-                f"SELECT user_id, 'USER'::role_type FROM \"user\" WHERE email = {_sql_escape(email)}\n"
-                "ON CONFLICT (user_id) DO NOTHING;\n"
+                'SELECT u.user_id, \'USER\'::role_type\n'
+                f'FROM "user" u\n'
+                f"WHERE u.email = {_sql_escape(email)}\n"
+                f"  AND NOT EXISTS (\n"
+                f"    SELECT 1 FROM role r WHERE r.user_id = u.user_id AND r.role = 'USER'::role_type\n"
+                f"  );\n"
             )
 
             # 4. Address (if available)

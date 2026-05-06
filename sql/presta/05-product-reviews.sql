@@ -9,7 +9,9 @@
 --   - has both content AND grade (skip orphan rows)
 --
 -- Output: product_reference, customer_name, customer_email,
---         rating, comment, title, date_add, date_upd
+--         rating, comment, title, date_add
+--
+-- (`ps_product_comment` has only `date_add` — no `date_upd` column.)
 --
 -- Note on ratings: ps_product_comment_grade has multiple grades per comment
 -- when there are criteria (taste, quality, etc.). We average them. If your
@@ -21,8 +23,7 @@ SELECT p.reference                       AS product_reference,
        AVG(pcg.grade)                    AS rating,
        pc.content                        AS comment,
        pc.title,
-       pc.date_add,
-       pc.date_upd
+       pc.date_add
 FROM ps_product_comment pc
 JOIN ps_product p ON p.id_product = pc.id_product
 LEFT JOIN ps_customer c ON c.id_customer = pc.id_customer
